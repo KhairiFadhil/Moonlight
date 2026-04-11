@@ -120,6 +120,18 @@ fn build_bot_table(
     let bot = lua.create_table()?;
 
     bot.set(
+        "warp",
+        create_async_method(
+            lua,
+            session.clone(),
+            cancel.clone(),
+            runtime.clone(),
+            |session, cancel, runtime, (_, world): (Value, String)| {
+                runtime.block_on(session.warp(&world, &cancel))
+            },
+        )?,
+    )?;
+    bot.set(
         "walk",
         create_async_method(
             lua,

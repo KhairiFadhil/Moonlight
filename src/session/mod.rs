@@ -531,6 +531,31 @@ impl BotSession {
         collect_all_visible_collectables_cancellable(&self.state, &outbound_tx, cancel).await
     }
 
+    pub(crate) async fn warp(&self, world: &str, cancel: &AtomicBool) -> Result<(), String> {
+        ensure_not_cancelled(cancel)?;
+        let world = world.trim().to_uppercase();
+        if world.is_empty() {
+            return Err("world is required".to_string());
+        }
+        let outbound_tx = self
+            .state
+            .read()
+            .await
+            .current_outbound_tx
+            .clone()
+            .ok_or_else(|| "connect the session before warping".to_string())?;
+        ensure_world_cancellable(
+            &self.id,
+            &self.logger,
+            &self.state,
+            &self.controller_tx,
+            &outbound_tx,
+            &world,
+            cancel,
+        )
+        .await
+    }
+
     pub(crate) async fn send_packet(
         &self,
         packet: Document,
@@ -3081,6 +3106,29 @@ async fn ensure_world(
     outbound_tx: &mpsc::Sender<OutboundEnvelope>,
     world: &str,
 ) -> Result<(), String> {
+    let cancel = AtomicBool::new(false);
+    ensure_world_cancellable(
+        session_id,
+        logger,
+        state,
+        controller_tx,
+        outbound_tx,
+        world,
+        &cancel,
+    )
+    .await
+}
+
+async fn ensure_world_cancellable(
+    session_id: &str,
+    logger: &Logger,
+    state: &Arc<RwLock<SessionState>>,
+    controller_tx: &mpsc::Sender<ControllerEvent>,
+    outbound_tx: &mpsc::Sender<OutboundEnvelope>,
+    world: &str,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    ensure_not_cancelled(cancel)?;
     let current = state.read().await.current_world.clone();
     let status = state.read().await.status.clone();
     if current.as_deref() == Some(world) && status == SessionStatus::InWorld {
@@ -3129,6 +3177,7 @@ async fn ensure_world(
 
     let deadline = Instant::now() + tutorial::world_join_timeout();
     loop {
+        ensure_not_cancelled(cancel)?;
         {
             let state = state.read().await;
             if state.current_world.as_deref() == Some(world)
@@ -3204,6 +3253,10 @@ async fn walk_to_map_cancellable(
     let steps = path.unwrap_or_else(|| {
         fallback_straight_line_path((start_x, start_y), (target_map_x, target_map_y))
     });
+    let mut last_direction = {
+        let state = state.read().await;
+        current_facing_direction(&state.player_position)
+    };
 
     for window in steps.windows(2) {
         ensure_not_cancelled(cancel)?;
@@ -3216,6 +3269,7 @@ async fn walk_to_map_cancellable(
         } else {
             movement::DIR_RIGHT
         };
+        last_direction = direction;
 
         move_to_map(
             state,
@@ -3230,7 +3284,11 @@ async fn walk_to_map_cancellable(
     }
 
     ensure_not_cancelled(cancel)?;
-    send_docs(outbound_tx, vec![protocol::make_empty_movement()]).await?;
+    send_docs(
+        outbound_tx,
+        vec![movement_doc(state, movement::ANIM_IDLE, last_direction).await],
+    )
+    .await?;
     Ok(())
 }
 
