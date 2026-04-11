@@ -17,7 +17,7 @@ cd web
 bun install
 bun run build
 cd ..
-cargo run
+cargo run --bin Moonlight
 ```
 
 Then open `http://127.0.0.1:3000`.

@@ -97,6 +97,7 @@ impl BotSession {
             world_background_tiles: Vec::new(),
             world_water_tiles: Vec::new(),
             world_wiring_tiles: Vec::new(),
+            growing_tiles: HashMap::new(),
             player_position: PlayerPosition {
                 map_x: None,
                 map_y: None,
@@ -194,6 +195,11 @@ impl BotSession {
     pub async fn automate_tutorial(&self) -> Result<String, String> {
         self.send_command(SessionCommand::AutomateTutorial).await?;
         Ok("Tutorial automation queued.".to_string())
+    }
+
+    pub async fn is_tile_ready_to_harvest(&self, map_x: i32, map_y: i32) -> Result<bool, String> {
+        let state = self.state.read().await;
+        is_tile_ready_to_harvest_at(&state, map_x, map_y, protocol::csharp_ticks())
     }
 
     pub async fn wear_item(&self, block_id: i32, equip: bool) -> Result<String, String> {
@@ -818,6 +824,9 @@ impl BotSession {
             ids::PACKET_ID_SET_BLOCK => {
                 self.apply_set_block_message(&message).await;
             }
+            ids::PACKET_ID_SEED_BLOCK => {
+                self.apply_seed_growth_message(&message).await;
+            }
             ids::PACKET_ID_DESTROY_BLOCK => {
                 self.apply_destroy_block_message(&message).await;
             }
@@ -903,6 +912,7 @@ impl BotSession {
                     state.world_background_tiles = decoded_world.background_tiles;
                     state.world_water_tiles = decoded_world.water_tiles;
                     state.world_wiring_tiles = decoded_world.wiring_tiles;
+                    state.growing_tiles.clear();
                     state.collectables.clear();
                     state.player_position = PlayerPosition {
                         map_x: decoded_world.snapshot.spawn_map_x,
@@ -1025,6 +1035,7 @@ impl BotSession {
             state.world_background_tiles.clear();
             state.world_water_tiles.clear();
             state.world_wiring_tiles.clear();
+            state.growing_tiles.clear();
             state.collectables.clear();
             state.player_position = PlayerPosition {
                 map_x: None,
@@ -1101,6 +1112,41 @@ impl BotSession {
         }
     }
 
+    async fn apply_seed_growth_message(&self, message: &Document) {
+        let Ok(map_x) = message.get_i32("x") else {
+            return;
+        };
+        let Ok(map_y) = message.get_i32("y") else {
+            return;
+        };
+        let Ok(growth_end_time) = message.get_i64("GrowthEndTime") else {
+            return;
+        };
+        let Ok(block_id) = message.get_i32("BlockType") else {
+            return;
+        };
+
+        let growth = GrowingTileState {
+            block_id: block_id.max(0) as u16,
+            growth_end_time,
+            growth_duration_secs: message.get_i32("GrowthDuration").unwrap_or_default().max(0),
+            mixed: message.get_bool("Mixed").unwrap_or(false),
+            harvest_seeds: message.get_i32("HarvestSeeds").unwrap_or_default().max(0),
+            harvest_blocks: message.get_i32("HarvestBlocks").unwrap_or_default().max(0),
+            harvest_gems: message.get_i32("HarvestGems").unwrap_or_default().max(0),
+            harvest_extra_blocks: message
+                .get_i32("HarvestExtraBlocks")
+                .unwrap_or_default()
+                .max(0),
+        };
+
+        self.state
+            .write()
+            .await
+            .growing_tiles
+            .insert((map_x, map_y), growth);
+    }
+
     async fn apply_destroy_block_message(&self, message: &Document) {
         let Ok(map_x) = message.get_i32("x") else {
             return;
@@ -1111,6 +1157,7 @@ impl BotSession {
 
         let changed = {
             let mut state = self.state.write().await;
+            state.growing_tiles.remove(&(map_x, map_y));
             apply_destroy_block_change(&mut state, map_x, map_y)
         };
         if changed {
@@ -1330,6 +1377,7 @@ struct SessionState {
     world_background_tiles: Vec<u16>,
     world_water_tiles: Vec<u16>,
     world_wiring_tiles: Vec<u16>,
+    growing_tiles: HashMap<(i32, i32), GrowingTileState>,
     player_position: PlayerPosition,
     inventory: Vec<InventoryEntry>,
     collectables: HashMap<i32, CollectableState>,
@@ -1422,6 +1470,18 @@ struct NamedInventoryEntry {
     name: String,
 }
 
+#[derive(Debug, Clone)]
+struct GrowingTileState {
+    block_id: u16,
+    growth_end_time: i64,
+    growth_duration_secs: i32,
+    mixed: bool,
+    harvest_seeds: i32,
+    harvest_blocks: i32,
+    harvest_gems: i32,
+    harvest_extra_blocks: i32,
+}
+
 fn stop_background_worker(stop_tx: &mut Option<watch::Sender<bool>>) {
     if let Some(tx) = stop_tx.take() {
         let _ = tx.send(true);
@@ -1501,6 +1561,23 @@ fn tile_index(world: &WorldSnapshot, map_x: i32, map_y: i32) -> Option<usize> {
     }
 
     Some(map_y * width + map_x)
+}
+
+fn is_tile_ready_to_harvest_at(
+    state: &SessionState,
+    map_x: i32,
+    map_y: i32,
+    now_ticks: i64,
+) -> Result<bool, String> {
+    if state.world.is_none() {
+        return Err("no world loaded yet".to_string());
+    }
+
+    let Some(growth) = state.growing_tiles.get(&(map_x, map_y)) else {
+        return Ok(false);
+    };
+
+    Ok(now_ticks >= growth.growth_end_time)
 }
 
 fn summarize_tile_counts(tiles: &[u16]) -> Vec<TileCount> {
@@ -3094,8 +3171,8 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        FishingAutomationState, SessionState, apply_destroy_block_change,
-        apply_foreground_block_change,
+        FishingAutomationState, GrowingTileState, SessionState, apply_destroy_block_change,
+        apply_foreground_block_change, is_tile_ready_to_harvest_at,
     };
     use crate::models::{PlayerPosition, SessionStatus, WorldSnapshot};
 
@@ -3130,6 +3207,7 @@ mod tests {
             world_background_tiles: background_tiles,
             world_water_tiles: Vec::new(),
             world_wiring_tiles: Vec::new(),
+            growing_tiles: HashMap::new(),
             player_position: PlayerPosition {
                 map_x: None,
                 map_y: None,
@@ -3213,6 +3291,35 @@ mod tests {
         assert_eq!(world.tile_counts.len(), 1);
         assert_eq!(world.tile_counts[0].tile_id, 0);
         assert_eq!(world.tile_counts[0].count, 4);
+    }
+
+    #[test]
+    fn growing_tile_reports_ready_only_after_growth_end_time() {
+        let mut state = test_state(2, 2, vec![0, 0, 0, 0], vec![0, 0, 0, 0]);
+        state.growing_tiles.insert(
+            (1, 1),
+            GrowingTileState {
+                block_id: 2,
+                growth_end_time: 1_000,
+                growth_duration_secs: 31,
+                mixed: false,
+                harvest_seeds: 0,
+                harvest_blocks: 5,
+                harvest_gems: 0,
+                harvest_extra_blocks: 0,
+            },
+        );
+
+        assert!(!is_tile_ready_to_harvest_at(&state, 1, 1, 999).unwrap());
+        assert!(is_tile_ready_to_harvest_at(&state, 1, 1, 1_000).unwrap());
+        assert!(is_tile_ready_to_harvest_at(&state, 1, 1, 1_001).unwrap());
+    }
+
+    #[test]
+    fn growing_tile_query_is_false_when_tile_is_not_tracked() {
+        let state = test_state(2, 2, vec![0, 0, 0, 0], vec![0, 0, 0, 0]);
+
+        assert!(!is_tile_ready_to_harvest_at(&state, 1, 1, 1_000).unwrap());
     }
 }
 

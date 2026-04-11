@@ -1,4 +1,4 @@
-pub const SERVER_HOST: &str = "3.79.101.106";
+pub const SERVER_HOST: &str = "63.176.210.142";
 pub const SERVER_PORT: u16 = 10001;
 pub const RELAUNCH_PASS: &str = "#m(y+JxiHzFNXJnOo&UHpVwOyV1R%wP";
 pub const PLAYFAB_TITLE_ID: &str = "11EF5C";
