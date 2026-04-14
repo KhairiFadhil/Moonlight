@@ -15,6 +15,8 @@ FROM rust:1.88-slim-bookworm AS builder
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y \
+    build-essential \
+    make \
     pkg-config \
     libssl-dev \
     ca-certificates \
