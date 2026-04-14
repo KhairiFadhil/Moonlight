@@ -724,12 +724,10 @@ impl BotSession {
             player_y,
             direction,
         )?;
-        let bait = find_inventory_bait(&state.inventory, bait_query)?;
+        find_inventory_bait(&state.inventory, bait_query)?;
         Ok(FishingTarget {
             direction: direction.to_string(),
-            bait_name: bait.name,
-            bait_block_id: bait.block_id as i32,
-            bait_inventory_key: bait.inventory_key,
+            bait_query: bait_query.trim().to_string(),
             map_x: target.0,
             map_y: target.1,
         })
@@ -1927,9 +1925,7 @@ struct CollectableState {
 #[derive(Debug, Clone)]
 struct FishingTarget {
     direction: String,
-    bait_name: String,
-    bait_block_id: i32,
-    bait_inventory_key: i32,
+    bait_query: String,
     map_x: i32,
     map_y: i32,
 }
@@ -2451,114 +2447,162 @@ async fn fishing_loop(
     mut stop_rx: watch::Receiver<bool>,
     target: FishingTarget,
 ) -> Result<(), String> {
-    {
-        let mut session = state.write().await;
-        session.fishing.active = true;
-        session.fishing.phase = FishingPhase::WaitingForHook;
-        session.fishing.target_map_x = Some(target.map_x);
-        session.fishing.target_map_y = Some(target.map_y);
-        session.fishing.bait_name = Some(target.bait_name.clone());
-        session.fishing.last_result = None;
-    }
-
-    logger.state(
-        Some(session_id),
-        format!(
-            "starting fishing at map=({}, {}) dir={} bait={}",
-            target.map_x, target.map_y, target.direction, target.bait_name
-        ),
-    );
-
-    send_docs(
-        outbound_tx,
-        vec![
-            protocol::make_select_belt_item(target.bait_inventory_key),
-            protocol::make_try_to_fish_from_map_point(
-                target.map_x,
-                target.map_y,
-                target.bait_block_id,
-            ),
-            protocol::make_start_fishing_game(
-                target.map_x,
-                target.map_y,
-                target.bait_block_id,
-            ),
-        ],
-    )
-    .await?;
-
     loop {
         if *stop_rx.borrow() {
             return stop_fishing_game(state, outbound_tx).await;
         }
 
-        let fishing = state.read().await.fishing.clone();
-        let phase = fishing.phase;
-        if phase == FishingPhase::CleanupPending || phase == FishingPhase::Completed {
-            return Ok(());
-        }
-        if !fishing.active {
-            return Err("fishing was reset before hook prompt".to_string());
-        }
-        if phase == FishingPhase::HookPrompted || phase == FishingPhase::GaugeActive {
-            break;
-        }
-        tokio::select! {
-            _ = stop_rx.changed() => {
-                if *stop_rx.borrow() {
-                    return stop_fishing_game(state, outbound_tx).await;
+        let bait = match consume_fishing_bait(state, &target.bait_query).await {
+            Ok(bait) => bait,
+            Err(_) => {
+                {
+                    let mut session = state.write().await;
+                    session.fishing = FishingAutomationState::default();
                 }
+                publish_state_snapshot(logger, session_id, state).await;
+                logger.state(
+                    Some(session_id),
+                    format!(
+                        "auto-fishing stopped: no more '{}' found in inventory",
+                        target.bait_query
+                    ),
+                );
+                return Ok(());
             }
-            _ = sleep(Duration::from_millis(100)) => {}
-        }
-    }
+        };
 
-    let hook_sent = state.read().await.fishing.hook_sent;
-    if !hook_sent {
         {
             let mut session = state.write().await;
-            session.fishing.hook_sent = true;
+            session.fishing = FishingAutomationState::default();
+            session.fishing.active = true;
+            session.fishing.phase = FishingPhase::WaitingForHook;
+            session.fishing.target_map_x = Some(target.map_x);
+            session.fishing.target_map_y = Some(target.map_y);
+            session.fishing.bait_name = Some(bait.name.clone());
+            session.fishing.last_result = None;
         }
-        send_docs(outbound_tx, vec![protocol::make_fishing_hook_action()]).await?;
-    }
+        publish_state_snapshot(logger, session_id, state).await;
 
-    let mut gauge_tick = interval(Duration::from_millis(50));
-    gauge_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        logger.state(
+            Some(session_id),
+            format!(
+                "starting fishing at map=({}, {}) dir={} bait={}",
+                target.map_x, target.map_y, target.direction, bait.name
+            ),
+        );
 
-    loop {
-        if *stop_rx.borrow() {
-            return stop_fishing_game(state, outbound_tx).await;
+        send_docs(
+            outbound_tx,
+            vec![
+                protocol::make_select_belt_item(bait.inventory_key),
+                protocol::make_try_to_fish_from_map_point(
+                    target.map_x,
+                    target.map_y,
+                    bait.block_id as i32,
+                ),
+                protocol::make_start_fishing_game(
+                    target.map_x,
+                    target.map_y,
+                    bait.block_id as i32,
+                ),
+            ],
+        )
+        .await?;
+
+        loop {
+            if *stop_rx.borrow() {
+                return stop_fishing_game(state, outbound_tx).await;
+            }
+
+            let fishing = state.read().await.fishing.clone();
+            let phase = fishing.phase;
+            if phase == FishingPhase::CleanupPending || phase == FishingPhase::Completed {
+                break;
+            }
+            if !fishing.active {
+                return Err("fishing was reset before hook prompt".to_string());
+            }
+            if phase == FishingPhase::HookPrompted || phase == FishingPhase::GaugeActive {
+                break;
+            }
+            tokio::select! {
+                _ = stop_rx.changed() => {
+                    if *stop_rx.borrow() {
+                        return stop_fishing_game(state, outbound_tx).await;
+                    }
+                }
+                _ = sleep(Duration::from_millis(100)) => {}
+            }
         }
 
-        let fishing = state.read().await.fishing.clone();
-        let phase = fishing.phase;
-        if phase == FishingPhase::CleanupPending {
-            continue;
-        }
-        if phase == FishingPhase::Completed {
-            return Ok(());
-        }
-        if !fishing.active {
-            return Err("fishing was reset before reward".to_string());
+        let hook_sent = state.read().await.fishing.hook_sent;
+        if !hook_sent {
+            {
+                let mut session = state.write().await;
+                session.fishing.hook_sent = true;
+            }
+            send_docs(outbound_tx, vec![protocol::make_fishing_hook_action()]).await?;
         }
 
-        tokio::select! {
-            _ = stop_rx.changed() => {
-                if *stop_rx.borrow() {
-                    return stop_fishing_game(state, outbound_tx).await;
+        let mut gauge_tick = interval(Duration::from_millis(50));
+        gauge_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        loop {
+            if *stop_rx.borrow() {
+                return stop_fishing_game(state, outbound_tx).await;
+            }
+
+            let fishing = state.read().await.fishing.clone();
+            let phase = fishing.phase;
+            if phase == FishingPhase::CleanupPending {
+                continue;
+            }
+            if phase == FishingPhase::Completed {
+                break;
+            }
+            if !fishing.active {
+                return Err("fishing was reset before reward".to_string());
+            }
+
+            tokio::select! {
+                _ = stop_rx.changed() => {
+                    if *stop_rx.borrow() {
+                        return stop_fishing_game(state, outbound_tx).await;
+                    }
+                }
+                _ = gauge_tick.tick() => {
+                    let packet = {
+                        let mut session = state.write().await;
+                        service_fishing_simulation(&mut session.fishing, Instant::now())
+                    };
+                    if let Some(packet) = packet {
+                        send_docs(outbound_tx, vec![packet]).await?;
+                    }
                 }
             }
-            _ = gauge_tick.tick() => {
-                let packet = {
-                    let mut session = state.write().await;
-                    service_fishing_simulation(&mut session.fishing, Instant::now())
-                };
-                if let Some(packet) = packet {
-                    send_docs(outbound_tx, vec![packet]).await?;
-                }
-            }
         }
+
+        sleep(Duration::from_millis(150)).await;
     }
+}
+
+async fn consume_fishing_bait(
+    state: &Arc<RwLock<SessionState>>,
+    bait_query: &str,
+) -> Result<NamedInventoryEntry, String> {
+    let mut session = state.write().await;
+    let bait = find_inventory_bait(&session.inventory, bait_query)?;
+    let item = session
+        .inventory
+        .iter_mut()
+        .find(|item| item.inventory_key == bait.inventory_key)
+        .ok_or_else(|| format!("bait '{bait_query}' was not found in inventory"))?;
+    if item.amount == 0 {
+        return Err(format!("bait '{bait_query}' was not found in inventory"));
+    }
+    item.amount -= 1;
+    session.inventory.retain(|item| item.amount > 0);
+    Ok(bait)
 }
 
 async fn stop_fishing_game(
@@ -3982,6 +4026,40 @@ async fn inventory_key_for(
         })
         .map(|entry| entry.inventory_key)
         .unwrap_or(fallback)
+}
+
+async fn publish_state_snapshot(
+    logger: &Logger,
+    session_id: &str,
+    state: &Arc<RwLock<SessionState>>,
+) {
+    let snapshot = {
+        let state = state.read().await;
+        SessionSnapshot {
+            id: session_id.to_string(),
+            status: state.status.clone(),
+            device_id: state.device_id.clone(),
+            current_host: state.current_host.clone(),
+            current_port: state.current_port,
+            current_world: state.current_world.clone(),
+            pending_world: state.pending_world.clone(),
+            username: state.username.clone(),
+            user_id: state.user_id.clone(),
+            world: state.world.clone(),
+            player_position: state.player_position.clone(),
+            inventory: state
+                .inventory
+                .iter()
+                .map(|e| InventoryItem {
+                    block_id: e.block_id,
+                    inventory_type: e.inventory_type,
+                    amount: e.amount,
+                })
+                .collect(),
+            last_error: state.last_error.clone(),
+        }
+    };
+    logger.session_snapshot(snapshot);
 }
 
 async fn wait_for_collectables(state: &Arc<RwLock<SessionState>>) -> Result<(), String> {
