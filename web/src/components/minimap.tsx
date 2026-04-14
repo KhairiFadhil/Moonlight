@@ -204,11 +204,12 @@ export function MinimapPanel({ minimap, playerPosition, onHoverChange }: Props) 
     }))
   }
 
-  const handleWheel = (event: React.WheelEvent<HTMLDivElement>) => {
+  const handleWheelEvent = useCallback((event: WheelEvent) => {
     if (!minimap || !containerRef.current) {
       return
     }
     event.preventDefault()
+    event.stopPropagation()
     const rect = containerRef.current.getBoundingClientRect()
     const pointX = event.clientX - rect.left
     const pointY = event.clientY - rect.top
@@ -229,7 +230,16 @@ export function MinimapPanel({ minimap, playerPosition, onHoverChange }: Props) 
         offsetY: pointY - worldY * nextZoom,
       }
     })
-  }
+  }, [minimap])
+
+  useEffect(() => {
+    const container = containerRef.current
+    if (!container) {
+      return
+    }
+    container.addEventListener("wheel", handleWheelEvent, { passive: false })
+    return () => container.removeEventListener("wheel", handleWheelEvent)
+  }, [handleWheelEvent])
 
   return (
     <div
@@ -251,7 +261,6 @@ export function MinimapPanel({ minimap, playerPosition, onHoverChange }: Props) 
         updateHover(null)
       }}
       onPointerMove={handlePointerMove}
-      onWheel={handleWheel}
     >
       {minimap && size.width > 0 && size.height > 0 ? (
         <Application
