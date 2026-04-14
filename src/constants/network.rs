@@ -9,7 +9,7 @@ pub const PLAYFAB_ANDROID_URL: &str =
     "https://11ef5c.playfabapi.com/Client/LoginWithAndroidDeviceID";
 pub const SOCIALFIRST_EXCHANGE_URL: &str = "https://pw-auth.pw.sclfrst.com/v1/auth/exchangeToken";
 pub const DEFAULT_DEVICE_ID: &str = "57ce9585c26da4fe279588e2414f4935a6318955";
-pub const DASHBOARD_BIND_ADDR: &str = "127.0.0.1:3000";
+pub const DASHBOARD_BIND_ADDR: &str = "0.0.0.0:3000";
 
 pub fn dashboard_bind_addr() -> &'static str {
     DASHBOARD_BIND_ADDR

@@ -15,19 +15,20 @@ export function stripAnsi(value: string) {
 }
 
 export function buildWebSocketUrl(token: string | null) {
-  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:"
   const query = token ? `?token=${encodeURIComponent(token)}` : ""
   if (import.meta.env.DEV) {
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:"
     return `${protocol}//${window.location.hostname}:3000/ws${query}`
   }
-  return `${protocol}//${window.location.host}/ws${query}`
+  const origin = window.location.origin.replace(/^http/, "ws")
+  return `${origin}/ws${query}`
 }
 
 export function buildBackendUrl(path: string) {
   if (import.meta.env.DEV) {
     return `http://${window.location.hostname}:3000${path}`
   }
-  return path
+  return `${window.location.origin}${path}`
 }
 
 export function camelToWords(name: string) {
