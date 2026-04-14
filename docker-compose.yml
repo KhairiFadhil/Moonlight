@@ -1,8 +1,6 @@
 services:
   moonlight:
     build: .
-    ports:
-      - "3000:3000"
     volumes:
       - moonlight-data:/app/data
 
