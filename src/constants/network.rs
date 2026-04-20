@@ -1,4 +1,4 @@
-pub const SERVER_HOST: &str = "game-lava.pixelworlds.pw";
+pub const SERVER_HOST: &str = "game-frost.pixelworlds.pw"; // serverAddress AsynchronousClient
 pub const SERVER_PORT: u16 = 10001;
 pub const RELAUNCH_PASS: &str = "xSzwX4rU!js%-x@lrJxk";
 pub const PLAYFAB_TITLE_ID: &str = "11EF5C";
