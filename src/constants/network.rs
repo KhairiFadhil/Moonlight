@@ -1,6 +1,6 @@
 pub const SERVER_HOST: &str = "game-frost.pixelworlds.pw"; // serverAddress AsynchronousClient
 pub const SERVER_PORT: u16 = 10001;
-pub const RELAUNCH_PASS: &str = "xSzwX4rU!js%-x@lrJxk";
+pub const RELAUNCH_PASS: &str = "3SGBxtoU%TKH795F1Fwe";
 pub const PLAYFAB_TITLE_ID: &str = "11EF5C";
 pub const SOCIALFIRST_API_KEY: &str = "QwvzCrL2CexvXs2798fetBjty";
 pub const UNITY_VERSION: &str = "6000.3.11f1";
