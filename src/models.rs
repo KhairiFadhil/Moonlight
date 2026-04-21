@@ -188,6 +188,7 @@ pub struct SessionSnapshot {
     pub player_position: PlayerPosition,
     pub inventory: Vec<InventoryItem>,
     pub last_error: Option<String>,
+    pub ping_ms: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

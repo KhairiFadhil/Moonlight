@@ -68,6 +68,7 @@ export type SessionSnapshot = {
   player_position: PlayerPosition
   inventory: InventoryItem[]
   last_error: string | null
+  ping_ms: number | null
 }
 
 export type MinimapSnapshot = {

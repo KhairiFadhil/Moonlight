@@ -170,6 +170,7 @@ impl BotSession {
             tutorial_spawn_pod_confirmed: false,
             tutorial_automation_running: false,
             fishing: FishingAutomationState::default(),
+            ping_ms: None,
         }));
 
         let session = Arc::new(Self {
@@ -212,6 +213,7 @@ impl BotSession {
                 })
                 .collect(),
             last_error: state.last_error.clone(),
+            ping_ms: state.ping_ms,
         }
     }
 
@@ -820,6 +822,11 @@ impl BotSession {
                         if let Some(active) = &runtime {
                             let _ =
                                 send_doc(&active.outbound_tx, protocol::make_leave_world()).await;
+                            let _ = send_scheduler_cmd(
+                                &active.outbound_tx,
+                                SchedulerCommand::LeaveWorld,
+                            )
+                            .await;
                         }
                         self.reset_world_state(SessionStatus::MenuReady).await;
                     }
@@ -1149,8 +1156,9 @@ impl BotSession {
         });
         let session_id = self.id.clone();
         let logger = self.logger.clone();
+        let state_for_scheduler = self.state.clone();
         tokio::spawn(async move {
-            scheduler_loop(write_half, outbound_rx, stop_rx, logger, session_id).await;
+            scheduler_loop(write_half, outbound_rx, stop_rx, logger, session_id, state_for_scheduler).await;
         });
 
         self.state.write().await.current_outbound_tx = Some(outbound_tx.clone());
@@ -1257,8 +1265,14 @@ impl BotSession {
     ) -> Result<(), String> {
         let id = message.get_str("ID").unwrap_or_default();
         match id {
-            ids::PACKET_ID_ST
-            | ids::PACKET_ID_KEEPALIVE
+            ids::PACKET_ID_ST => {
+                let _ = send_scheduler_cmd(
+                    &runtime.outbound_tx,
+                    SchedulerCommand::StResponseReceived,
+                )
+                .await;
+            }
+            ids::PACKET_ID_KEEPALIVE
             | ids::PACKET_ID_VCHK
             | ids::PACKET_ID_WREU
             | ids::PACKET_ID_BCSU
@@ -1422,6 +1436,11 @@ impl BotSession {
                         state.awaiting_ready = false;
                         state.status = SessionStatus::InWorld;
                     }
+                    let _ = send_scheduler_cmd(
+                        &runtime.outbound_tx,
+                        SchedulerCommand::EnterWorld,
+                    )
+                    .await;
                     self.publish_snapshot().await;
                 }
             }
@@ -1802,6 +1821,90 @@ struct ActiveRuntime {
 enum OutboundEnvelope {
     Single(Document),
     Batch(Vec<Document>),
+    Control(SchedulerCommand),
+}
+
+#[derive(Debug)]
+enum SchedulerCommand {
+    SetMovement {
+        world_x: f64,
+        world_y: f64,
+        is_moving: bool,
+        anim: i32,
+        direction: i32,
+    },
+    EnterWorld,
+    LeaveWorld,
+    StResponseReceived,
+}
+
+#[derive(Debug, Clone)]
+struct MovementTickState {
+    in_world: bool,
+    world_x: f64,
+    world_y: f64,
+    is_moving: bool,
+    anim: i32,
+    direction: i32,
+}
+
+impl Default for MovementTickState {
+    fn default() -> Self {
+        Self {
+            in_world: false,
+            world_x: 0.0,
+            world_y: 0.0,
+            is_moving: false,
+            anim: movement::ANIM_IDLE,
+            direction: movement::DIR_RIGHT,
+        }
+    }
+}
+
+struct StSyncState {
+    samples: [i32; timing::ST_SAMPLE_COUNT],
+    sample_count: usize,
+    success_counter: i32,
+    interval_secs: i32,
+    last_sent_at: Option<std::time::Instant>,
+}
+
+impl StSyncState {
+    fn new() -> Self {
+        Self {
+            samples: [i32::MAX; timing::ST_SAMPLE_COUNT],
+            sample_count: 0,
+            success_counter: 0,
+            interval_secs: timing::ST_INTERVAL_INIT_SECS,
+            last_sent_at: None,
+        }
+    }
+
+    fn record_sample(&mut self, rtt_ms: i32) {
+        let idx = self.sample_count % timing::ST_SAMPLE_COUNT;
+        self.samples[idx] = rtt_ms;
+        self.sample_count += 1;
+
+        let valid_count = self.sample_count.min(timing::ST_SAMPLE_COUNT);
+        let mut sorted = self.samples;
+        sorted[..valid_count].sort_unstable();
+        let median = sorted[valid_count / 2];
+
+        let deviation = (rtt_ms - median).abs();
+
+        if deviation >= self.interval_secs * 1000 {
+            self.interval_secs =
+                (self.interval_secs - timing::ST_INTERVAL_STEP_SECS).max(timing::ST_INTERVAL_MIN_SECS);
+            self.success_counter = 0;
+        } else {
+            self.success_counter += 1;
+            if self.success_counter > timing::ST_SUCCESS_THRESHOLD {
+                self.success_counter = 0;
+                self.interval_secs =
+                    (self.interval_secs + timing::ST_INTERVAL_STEP_SECS).min(timing::ST_INTERVAL_MAX_SECS);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1916,6 +2019,7 @@ struct SessionState {
     tutorial_spawn_pod_confirmed: bool,
     tutorial_automation_running: bool,
     fishing: FishingAutomationState,
+    ping_ms: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -2728,13 +2832,21 @@ async fn scheduler_loop(
     mut stop_rx: watch::Receiver<bool>,
     logger: Logger,
     session_id: String,
+    state: Arc<RwLock<SessionState>>,
 ) {
-    let mut st_tick = interval(timing::st_interval());
+    let mut movement = MovementTickState::default();
+    let mut st_sync = StSyncState::new();
+
+    let mut movement_tick = interval(timing::movement_tick_interval());
     let mut keepalive_tick = interval(timing::keepalive_interval());
     let mut flush_tick = interval(timing::flush_interval());
-    st_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    movement_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     keepalive_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     flush_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    // Fire the first ST immediately to begin the initial calibration burst.
+    let mut st_deadline = tokio::time::Instant::now();
+    let mut st_sleep = Box::pin(tokio::time::sleep_until(st_deadline));
 
     let mut outbox = Vec::<Document>::new();
 
@@ -2745,12 +2857,37 @@ async fn scheduler_loop(
                     return;
                 }
             }
-            _ = st_tick.tick() => {
+
+            _ = &mut st_sleep => {
                 outbox.push(protocol::make_st());
+                st_sync.last_sent_at = Some(std::time::Instant::now());
+                st_deadline = tokio::time::Instant::now()
+                    + Duration::from_secs(st_sync.interval_secs as u64);
+                st_sleep.as_mut().reset(st_deadline);
             }
+
+            _ = movement_tick.tick() => {
+                if movement.in_world {
+                    if movement.is_moving {
+                        outbox.push(protocol::make_movement_packet(
+                            movement.world_x,
+                            movement.world_y,
+                            movement.anim,
+                            movement.direction,
+                            false,
+                        ));
+                    } else {
+                        outbox.push(protocol::make_keepalive());
+                    }
+                }
+            }
+
             _ = keepalive_tick.tick() => {
-                outbox.push(protocol::make_keepalive());
+                if !movement.in_world {
+                    outbox.push(protocol::make_keepalive());
+                }
             }
+
             _ = flush_tick.tick() => {
                 if !outbox.is_empty() {
                     logger.transport(
@@ -2766,12 +2903,48 @@ async fn scheduler_loop(
                     outbox.clear();
                 }
             }
-            Some(message) = outbound_rx.recv() => {
-                match message {
-                    OutboundEnvelope::Single(message) => outbox.push(message),
-                    OutboundEnvelope::Batch(messages) => outbox.extend(messages),
+
+            Some(envelope) = outbound_rx.recv() => {
+                match envelope {
+                    OutboundEnvelope::Single(doc) => outbox.push(doc),
+                    OutboundEnvelope::Batch(docs) => outbox.extend(docs),
+                    OutboundEnvelope::Control(cmd) => match cmd {
+                        SchedulerCommand::SetMovement { world_x, world_y, is_moving, anim, direction } => {
+                            movement.world_x = world_x;
+                            movement.world_y = world_y;
+                            movement.is_moving = is_moving;
+                            movement.anim = anim;
+                            movement.direction = direction;
+                        }
+                        SchedulerCommand::EnterWorld => {
+                            movement.in_world = true;
+                        }
+                        SchedulerCommand::LeaveWorld => {
+                            movement.in_world = false;
+                            movement.is_moving = false;
+                        }
+                        SchedulerCommand::StResponseReceived => {
+                            if let Some(sent_at) = st_sync.last_sent_at.take() {
+                                let rtt_ms = sent_at.elapsed().as_millis() as i32;
+                                st_sync.record_sample(rtt_ms);
+                                state.write().await.ping_ms = Some(rtt_ms as u32);
+                                // During the initial burst (< 15 samples) fire the next
+                                // ST immediately, mirroring the chain-reaction in the game
+                                // client (SetTimeOffset sends another RequestServerTime
+                                // until all 15 sample slots are filled).
+                                let next = if st_sync.sample_count < timing::ST_SAMPLE_COUNT {
+                                    Duration::ZERO
+                                } else {
+                                    Duration::from_secs(st_sync.interval_secs as u64)
+                                };
+                                st_deadline = tokio::time::Instant::now() + next;
+                                st_sleep.as_mut().reset(st_deadline);
+                            }
+                        }
+                    },
                 }
             }
+
             else => return,
         }
     }
@@ -3241,39 +3414,39 @@ async fn run_tutorial_script(
     send_docs(&outbound_tx, vec![protocol::make_tstate(3)]).await?;
 
     // Idle in PIXELSTATION briefly (recs 838-884 ≈ 9 seconds).
-    sleep(Duration::from_secs(9)).await;
+    // sleep(Duration::from_secs(9)).await;
 
     // Leave PIXELSTATION (rec 884).
-    send_docs(&outbound_tx, vec![protocol::make_leave_world()]).await?;
-    sleep(tutorial::medium_pause()).await;
+    // send_docs(&outbound_tx, vec![protocol::make_leave_world()]).await?;
+    // sleep(tutorial::medium_pause()).await;
 
     // Return to menu and set up floating chest UI (rec 890).
-    send_docs(
-        &outbound_tx,
-        vec![
-            protocol::make_wreu(),
-            protocol::make_bcsu(),
-            protocol::make_update_location("#menu"),
-            protocol::make_ui_event_count(4),
-            protocol::make_ui_gift_view(0, 0),
-            protocol::make_ui_event_count(9),
-            protocol::make_floating_chest_refresh(),
-        ],
-    )
-    .await?;
-    sleep(tutorial::short_pause()).await;
+    // send_docs(
+    //     &outbound_tx,
+    //     vec![
+    //         protocol::make_wreu(),
+    //         protocol::make_bcsu(),
+    //         protocol::make_update_location("#menu"),
+    //         protocol::make_ui_event_count(4),
+    //         protocol::make_ui_gift_view(0, 0),
+    //         protocol::make_ui_event_count(9),
+    //         protocol::make_floating_chest_refresh(),
+    //     ],
+    // )
+    // .await?;
+    // sleep(tutorial::short_pause()).await;
 
     // gLSI handshake (rec 894).
-    send_docs(&outbound_tx, protocol::make_glsi()).await?;
+    // send_docs(&outbound_tx, protocol::make_glsi()).await?;
 
     // Wait for floating chest timer to register (recs 894-944 ≈ 10 seconds).
-    sleep(Duration::from_secs(10)).await;
+    // sleep(Duration::from_secs(10)).await;
 
     // Claim the floating chest (rec 944-946).
-    send_docs(&outbound_tx, vec![protocol::make_world_gift_request()]).await?;
-    sleep(tutorial::short_pause()).await;
-    send_docs(&outbound_tx, vec![protocol::make_ui_event_count(9)]).await?;
-    sleep(tutorial::medium_pause()).await;
+    // send_docs(&outbound_tx, vec![protocol::make_world_gift_request()]).await?;
+    // sleep(tutorial::short_pause()).await;
+    // send_docs(&outbound_tx, vec![protocol::make_ui_event_count(9)]).await?;
+    // sleep(tutorial::medium_pause()).await;
 
     logger.state(Some(&session_id), "tutorial automation complete");
     logger.tutorial_completed(session_id.clone());
@@ -3390,6 +3563,16 @@ async fn send_doc(
         .map_err(|error| error.to_string())
 }
 
+async fn send_scheduler_cmd(
+    outbound_tx: &mpsc::Sender<OutboundEnvelope>,
+    cmd: SchedulerCommand,
+) -> Result<(), String> {
+    outbound_tx
+        .send(OutboundEnvelope::Control(cmd))
+        .await
+        .map_err(|error| error.to_string())
+}
+
 async fn send_docs(
     outbound_tx: &mpsc::Sender<OutboundEnvelope>,
     docs: Vec<Document>,
@@ -3471,9 +3654,22 @@ async fn walk_to_map_cancellable(
     }
 
     ensure_not_cancelled(cancel)?;
-    send_docs(
+    let (world_x, world_y) = {
+        let s = state.read().await;
+        (
+            s.player_position.world_x.unwrap_or_default(),
+            s.player_position.world_y.unwrap_or_default(),
+        )
+    };
+    send_scheduler_cmd(
         outbound_tx,
-        vec![movement_doc(state, movement::ANIM_IDLE, last_direction).await],
+        SchedulerCommand::SetMovement {
+            world_x,
+            world_y,
+            is_moving: false,
+            anim: movement::ANIM_IDLE,
+            direction: last_direction,
+        },
     )
     .await?;
     Ok(())
@@ -3540,7 +3736,31 @@ async fn walk_predefined_path(
         sleep(tutorial::walk_step_pause()).await;
     }
 
-    send_docs(outbound_tx, vec![protocol::make_empty_movement()]).await?;
+    let (world_x, world_y) = {
+        let s = state.read().await;
+        (
+            s.player_position.world_x.unwrap_or_default(),
+            s.player_position.world_y.unwrap_or_default(),
+        )
+    };
+    let last_direction = if steps.last().copied().unwrap_or_default().0
+        < steps.get(steps.len().saturating_sub(2)).copied().unwrap_or_default().0
+    {
+        movement::DIR_LEFT
+    } else {
+        movement::DIR_RIGHT
+    };
+    send_scheduler_cmd(
+        outbound_tx,
+        SchedulerCommand::SetMovement {
+            world_x,
+            world_y,
+            is_moving: false,
+            anim: movement::ANIM_IDLE,
+            direction: last_direction,
+        },
+    )
+    .await?;
     Ok(())
 }
 
@@ -3589,20 +3809,29 @@ async fn manual_move(
         ),
     );
     set_local_map_position(logger, session_id, state, target_map_x, target_map_y).await;
-    send_docs(
+    let (world_x, world_y) = protocol::map_to_world(target_map_x as f64, target_map_y as f64);
+    send_doc(outbound_tx, protocol::make_map_point(target_map_x, target_map_y)).await?;
+    send_scheduler_cmd(
         outbound_tx,
-        protocol::make_move_to_map_point(
-            target_map_x,
-            target_map_y,
-            movement::ANIM_WALK,
-            facing_direction,
-        ),
+        SchedulerCommand::SetMovement {
+            world_x,
+            world_y,
+            is_moving: true,
+            anim: movement::ANIM_WALK,
+            direction: facing_direction,
+        },
     )
     .await?;
     sleep(tutorial::walk_step_pause()).await;
-    send_docs(
+    send_scheduler_cmd(
         outbound_tx,
-        vec![movement_doc(state, movement::ANIM_IDLE, facing_direction).await],
+        SchedulerCommand::SetMovement {
+            world_x,
+            world_y,
+            is_moving: false,
+            anim: movement::ANIM_IDLE,
+            direction: facing_direction,
+        },
     )
     .await?;
     sleep(Duration::from_millis(120)).await;
@@ -3824,17 +4053,27 @@ async fn move_to_map(
     direction: i32,
     anim: i32,
 ) -> Result<(), String> {
-    {
+    let (world_x, world_y) = {
         let mut state = state.write().await;
         let (world_x, world_y) = protocol::map_to_world(map_x as f64, map_y as f64);
         state.player_position.map_x = Some(map_x as f64);
         state.player_position.map_y = Some(map_y as f64);
         state.player_position.world_x = Some(world_x);
         state.player_position.world_y = Some(world_y);
-    }
-    send_docs(
+        (world_x, world_y)
+    };
+    // Declare the step to the server (once per step).
+    send_doc(outbound_tx, protocol::make_map_point(map_x, map_y)).await?;
+    // Hand position to the scheduler so the 60fps tick sends it continuously.
+    send_scheduler_cmd(
         outbound_tx,
-        protocol::make_move_to_map_point(map_x, map_y, anim, direction),
+        SchedulerCommand::SetMovement {
+            world_x,
+            world_y,
+            is_moving: anim != movement::ANIM_IDLE,
+            anim,
+            direction,
+        },
     )
     .await
 }
@@ -3955,6 +4194,7 @@ mod tests {
             tutorial_spawn_pod_confirmed: false,
             tutorial_automation_running: false,
             fishing: FishingAutomationState::default(),
+            ping_ms: None,
         }
     }
 
@@ -4178,6 +4418,7 @@ async fn publish_state_snapshot(
                 })
                 .collect(),
             last_error: state.last_error.clone(),
+            ping_ms: state.ping_ms,
         }
     };
     logger.session_snapshot(snapshot);
@@ -4241,6 +4482,7 @@ async fn set_local_map_position(
                 })
                 .collect(),
             last_error: state.last_error.clone(),
+            ping_ms: state.ping_ms,
         }
     };
     logger.session_snapshot(snapshot);

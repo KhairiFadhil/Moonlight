@@ -921,7 +921,8 @@ function App() {
                                 position map=({session.player_position.map_x ?? "-"},{" "}
                                 {session.player_position.map_y ?? "-"}) world=(
                                 {session.player_position.world_x ?? "-"},{" "}
-                                {session.player_position.world_y ?? "-"})
+                                {session.player_position.world_y ?? "-"}) ping=
+                                {session.ping_ms != null ? `${session.ping_ms}ms` : "-"}
                               </div>
                               {session.last_error ? (
                                 <div className="text-xs text-red-200">{session.last_error}</div>
