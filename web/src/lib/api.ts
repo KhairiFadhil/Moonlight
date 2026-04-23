@@ -3,6 +3,7 @@ import type {
   ApiMessage,
   AuthInput,
   BlockNameMap,
+  BlockType,
   DashboardAuthResponse,
   DashboardAuthStatus,
   LuaScriptStatusSnapshot,
@@ -193,8 +194,9 @@ export function stopSpam(sessionId: string) {
   })
 }
 
-export function loadBlockTypes() {
-  return request<BlockNameMap>("/block_types.json")
+export async function loadBlockTypes(): Promise<BlockNameMap> {
+  const types = await request<BlockType[]>("/block_types.json")
+  return Object.fromEntries(types.map((t) => [String(t.id), t.name]))
 }
 
 export function startLuaScript(sessionId: string, source: string) {

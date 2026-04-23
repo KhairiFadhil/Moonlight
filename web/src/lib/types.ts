@@ -126,6 +126,13 @@ export type ServerEvent =
       event: TutorialCompletedEvent
     }
 
+export type BlockType = {
+  id: number
+  name: string
+  type: number
+  typeName: string
+}
+
 export type BlockNameMap = Record<string, string>
 
 export type DashboardAuthStatus = {

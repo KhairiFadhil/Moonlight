@@ -2879,8 +2879,6 @@ async fn scheduler_loop(
                             movement.direction,
                             false,
                         ));
-                    } else {
-                        outbox.push(protocol::make_keepalive());
                     }
                 }
             }
@@ -2892,7 +2890,11 @@ async fn scheduler_loop(
             }
 
             _ = ping_tick.tick() => {
-                if !movement.in_world {
+                if movement.in_world {
+                    if !movement.is_moving {
+                        outbox.push(protocol::make_empty_movement());
+                    }
+                } else {
                     logger.transport(
                         TransportKind::Tcp,
                         Direction::Outgoing,
@@ -4083,7 +4085,7 @@ async fn move_to_map(
     };
     // Declare the step to the server (once per step).
     send_doc(outbound_tx, protocol::make_map_point(map_x, map_y)).await?;
-    // Hand position to the scheduler so the 60fps tick sends it continuously.
+    // Hand position to the scheduler so movement updates continue while walking.
     send_scheduler_cmd(
         outbound_tx,
         SchedulerCommand::SetMovement {
