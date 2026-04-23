@@ -180,6 +180,7 @@ impl BotSession {
             awaiting_ready: false,
             tutorial_spawn_pod_confirmed: false,
             tutorial_automation_running: false,
+            tutorial_phase4_acknowledged: false,
             fishing: FishingAutomationState::default(),
             ping_ms: None,
         }));
@@ -1456,6 +1457,11 @@ impl BotSession {
                 let raw = protocol::binary_bytes(message.get("W")).unwrap_or_default();
                 let world_name = self.state.read().await.current_world.clone();
                 let decoded_world = world::decode_gwc(world_name.clone(), &raw)?;
+                let tutorial_phase_owned = {
+                    let state = self.state.read().await;
+                    state.tutorial_automation_running
+                        && world_name.as_deref() == Some(tutorial::TUTORIAL_WORLD)
+                };
                 {
                     let mut state = self.state.write().await;
                     state.world = Some(decoded_world.snapshot.clone());
@@ -1474,24 +1480,40 @@ impl BotSession {
                     };
                     state.status = SessionStatus::AwaitingReady;
                     state.awaiting_ready = true;
+                    state.tutorial_phase4_acknowledged = false;
                 }
                 self.publish_snapshot().await;
 
-                if let Some(world) = world_name {
-                    let _ = send_docs_exclusive(
-                        &runtime.outbound_tx,
-                        protocol::make_spawn_location_sync(&world),
-                    )
-                    .await;
-                    let _ = send_docs_exclusive(&runtime.outbound_tx, protocol::make_spawn_setup())
+                if !tutorial_phase_owned {
+                    if let Some(world) = world_name {
+                        let _ = send_docs_exclusive(
+                            &runtime.outbound_tx,
+                            protocol::make_spawn_location_sync(&world),
+                        )
                         .await;
+                        let _ =
+                            send_docs_exclusive(&runtime.outbound_tx, protocol::make_spawn_setup())
+                                .await;
+                    }
                 }
             }
             ids::PACKET_ID_R_OP => {
                 self.update_status(SessionStatus::AwaitingReady, None).await;
             }
             ids::PACKET_ID_R_AI => {
-                let should_ready = self.state.read().await.awaiting_ready;
+                let (should_ready, tutorial_phase_owned) = {
+                    let mut state = self.state.write().await;
+                    let tutorial_phase_owned = state.tutorial_automation_running
+                        && state.current_world.as_deref() == Some(tutorial::TUTORIAL_WORLD)
+                        && state.awaiting_ready;
+                    if tutorial_phase_owned {
+                        state.tutorial_phase4_acknowledged = true;
+                    }
+                    (state.awaiting_ready, tutorial_phase_owned)
+                };
+                if tutorial_phase_owned {
+                    return Ok(());
+                }
                 if should_ready {
                     let _ =
                         send_docs_exclusive(&runtime.outbound_tx, protocol::make_ready_to_play())
@@ -1632,6 +1654,7 @@ impl BotSession {
             state.awaiting_ready = false;
             state.tutorial_spawn_pod_confirmed = false;
             state.tutorial_automation_running = false;
+            state.tutorial_phase4_acknowledged = false;
             state.fishing = FishingAutomationState::default();
             state.last_error = None;
         }
@@ -2388,6 +2411,7 @@ struct SessionState {
     awaiting_ready: bool,
     tutorial_spawn_pod_confirmed: bool,
     tutorial_automation_running: bool,
+    tutorial_phase4_acknowledged: bool,
     fishing: FishingAutomationState,
     ping_ms: Option<u32>,
 }
@@ -3342,13 +3366,461 @@ fn decode_inventory(profile: &Document) -> Vec<InventoryEntry> {
 }
 
 async fn run_tutorial_script(
-    _session_id: String,
-    _logger: Logger,
-    _state: Arc<RwLock<SessionState>>,
+    session_id: String,
+    logger: Logger,
+    state: Arc<RwLock<SessionState>>,
     _controller_tx: mpsc::Sender<ControllerEvent>,
-    _outbound_tx: OutboundHandle,
+    outbound_tx: OutboundHandle,
 ) -> Result<(), String> {
+    logger.state(
+        Some(&session_id),
+        "tutorial automation: replaying phase 3/4 world-join flow",
+    );
+
+    {
+        let mut state = state.write().await;
+        state.tutorial_phase4_acknowledged = false;
+    }
+
+    let should_send_phase3 = {
+        let state = state.read().await;
+        state.current_world.as_deref() != Some(tutorial::TUTORIAL_WORLD)
+            || state.status == SessionStatus::MenuReady
+    };
+
+    if should_send_phase3 {
+        {
+            let mut state = state.write().await;
+            state.current_world = Some(tutorial::TUTORIAL_WORLD.to_string());
+            state.pending_world = Some(tutorial::TUTORIAL_WORLD.to_string());
+            state.status = SessionStatus::LoadingWorld;
+            state.awaiting_ready = false;
+            state.world = None;
+            state.world_foreground_tiles.clear();
+            state.world_background_tiles.clear();
+            state.world_water_tiles.clear();
+            state.world_wiring_tiles.clear();
+            state.collectables.clear();
+            state.other_players.clear();
+        }
+        send_docs_exclusive(
+            &outbound_tx,
+            {
+                let mut docs = protocol::make_enter_world_eid(tutorial::TUTORIAL_WORLD, "Start");
+                docs.push(protocol::make_st());
+                docs
+            },
+        )
+        .await?;
+    }
+
+    wait_for_tutorial_world_ready_to_enter(&state).await?;
+    sleep(Duration::from_millis(20)).await;
+
+    send_docs_exclusive(
+        &outbound_tx,
+        protocol::make_world_enter_ready(tutorial::TUTORIAL_WORLD, 0.40),
+    )
+    .await?;
+
+    wait_for_tutorial_phase4_ack(&state).await?;
+
+    send_docs_exclusive(&outbound_tx, protocol::make_ready_to_play_with_st()).await?;
+
+    sleep(tutorial::initial_spawn_pause()).await;
+
+    let (spawn_world_x, spawn_world_y) = protocol::map_to_world(
+        tutorial::TUTORIAL_SPAWN_MAP_X as f64,
+        tutorial::TUTORIAL_SPAWN_MAP_Y as f64,
+    );
+    let mut spawn_batch = protocol::make_spawn_packets(
+        tutorial::TUTORIAL_SPAWN_MAP_X,
+        tutorial::TUTORIAL_SPAWN_MAP_Y,
+        spawn_world_x,
+        spawn_world_y,
+    );
+    spawn_batch.push(protocol::make_st());
+    send_docs_exclusive(&outbound_tx, spawn_batch).await?;
+
+    {
+        let mut state = state.write().await;
+        state.player_position = PlayerPosition {
+            map_x: Some(tutorial::TUTORIAL_SPAWN_MAP_X as f64),
+            map_y: Some(tutorial::TUTORIAL_SPAWN_MAP_Y as f64),
+            world_x: Some(spawn_world_x),
+            world_y: Some(spawn_world_y),
+        };
+        state.current_direction = movement::DIR_RIGHT;
+        state.awaiting_ready = false;
+        state.status = SessionStatus::InWorld;
+    }
+    send_scheduler_cmd(
+        &outbound_tx,
+        SchedulerCommand::UpdateMovement {
+            world_x: spawn_world_x,
+            world_y: spawn_world_y,
+            is_moving: false,
+            anim: movement::ANIM_IDLE,
+            direction: movement::DIR_RIGHT,
+        },
+    )
+    .await?;
+    send_scheduler_cmd(
+        &outbound_tx,
+        SchedulerCommand::SetPhase {
+            phase: SchedulerPhase::WorldIdle,
+        },
+    )
+    .await?;
+
+    sleep(tutorial::post_spawn_tstate_pause()).await;
+    send_docs_exclusive(
+        &outbound_tx,
+        vec![protocol::make_empty_movement(), protocol::make_tstate(4)],
+    )
+    .await?;
+
+    sleep(tutorial::pre_charc_friends_list_pause()).await;
+    send_docs_exclusive(
+        &outbound_tx,
+        vec![protocol::make_empty_movement(), protocol::make_gfli()],
+    )
+    .await?;
+
+    sleep(tutorial::pre_charc_st_pause()).await;
+    send_docs_exclusive(
+        &outbound_tx,
+        vec![protocol::make_empty_movement(), protocol::make_st()],
+    )
+    .await?;
+
+    sleep(tutorial::pre_charc_create_pause()).await;
+    send_docs_exclusive(
+        &outbound_tx,
+        vec![
+            protocol::make_empty_movement(),
+            protocol::make_character_create(
+                tutorial::TUTORIAL_GENDER,
+                tutorial::TUTORIAL_COUNTRY,
+                tutorial::TUTORIAL_SKIN_COLOR,
+            ),
+            protocol::make_wear_item(tutorial::STARTER_FACE_BLOCK),
+            protocol::make_wear_item(tutorial::STARTER_HAIR_BLOCK),
+        ],
+    )
+    .await?;
+
+    wait_for_tutorial_spawn_pod_confirmation(&state).await?;
+
+    sleep(tutorial::post_apu_first_step_pause()).await;
+    for (index, (map_x, map_y)) in tutorial::SPAWN_POD_CONFIRM_PATH.iter().enumerate() {
+        send_docs_exclusive(
+            &outbound_tx,
+            vec![protocol::make_map_point(*map_x, *map_y), protocol::make_empty_movement()],
+        )
+        .await?;
+
+        let (world_x, world_y) = protocol::map_to_world(*map_x as f64, *map_y as f64);
+        set_local_map_position(&logger, &session_id, &state, *map_x, *map_y).await;
+        {
+            let mut state = state.write().await;
+            state.current_direction = movement::DIR_RIGHT;
+        }
+        send_scheduler_cmd(
+            &outbound_tx,
+            SchedulerCommand::UpdateMovement {
+                world_x,
+                world_y,
+                is_moving: false,
+                anim: movement::ANIM_IDLE,
+                direction: movement::DIR_RIGHT,
+            },
+        )
+        .await?;
+
+        match index {
+            0 => sleep(tutorial::post_apu_second_step_pause()).await,
+            1 => sleep(tutorial::post_apu_third_step_pause()).await,
+            _ => {}
+        }
+    }
+
+    sleep(tutorial::post_apu_tstate5_pause()).await;
+    send_docs_exclusive(
+        &outbound_tx,
+        vec![protocol::make_empty_movement(), protocol::make_tstate(5)],
+    )
+    .await?;
+
+    sleep(tutorial::portal_walk_start_pause()).await;
+    send_docs_exclusive(
+        &outbound_tx,
+        vec![
+            protocol::make_map_point(43, 44),
+            protocol::make_movement_packet(13.80, 13.92, movement::ANIM_WALK, movement::DIR_RIGHT, false),
+        ],
+    )
+    .await?;
+    set_local_world_position(&logger, &session_id, &state, 13.80, 13.92).await;
+    send_scheduler_cmd(
+        &outbound_tx,
+        SchedulerCommand::UpdateMovement {
+            world_x: 13.80,
+            world_y: 13.92,
+            is_moving: true,
+            anim: movement::ANIM_WALK,
+            direction: movement::DIR_RIGHT,
+        },
+    )
+    .await?;
+
+    sleep(tutorial::portal_walk_step_pause()).await;
+    send_docs_exclusive(
+        &outbound_tx,
+        vec![
+            protocol::make_map_point(44, 44),
+            protocol::make_movement_packet(14.16, 13.92, movement::ANIM_WALK, movement::DIR_RIGHT, false),
+        ],
+    )
+    .await?;
+    set_local_world_position(&logger, &session_id, &state, 14.16, 13.92).await;
+    send_scheduler_cmd(
+        &outbound_tx,
+        SchedulerCommand::UpdateMovement {
+            world_x: 14.16,
+            world_y: 13.92,
+            is_moving: true,
+            anim: movement::ANIM_WALK,
+            direction: movement::DIR_RIGHT,
+        },
+    )
+    .await?;
+
+    sleep(tutorial::portal_walk_idle_pause()).await;
+    send_docs_exclusive(
+        &outbound_tx,
+        vec![protocol::make_movement_packet(
+            14.16,
+            13.92,
+            movement::ANIM_IDLE,
+            movement::DIR_RIGHT,
+            false,
+        )],
+    )
+    .await?;
+    set_local_world_position(&logger, &session_id, &state, 14.16, 13.92).await;
+    send_scheduler_cmd(
+        &outbound_tx,
+        SchedulerCommand::UpdateMovement {
+            world_x: 14.16,
+            world_y: 13.92,
+            is_moving: false,
+            anim: movement::ANIM_IDLE,
+            direction: movement::DIR_RIGHT,
+        },
+    )
+    .await?;
+
+    sleep(tutorial::portal_jump_pause()).await;
+    send_docs_exclusive(
+        &outbound_tx,
+        vec![
+            protocol::make_map_point(44, 45),
+            protocol::make_movement_packet(14.19, 14.40, 3, movement::DIR_RIGHT, false),
+            protocol::make_audio_player_action(20, 1950),
+        ],
+    )
+    .await?;
+    set_local_world_position(&logger, &session_id, &state, 14.19, 14.40).await;
+    send_scheduler_cmd(
+        &outbound_tx,
+        SchedulerCommand::UpdateMovement {
+            world_x: 14.19,
+            world_y: 14.40,
+            is_moving: true,
+            anim: 3,
+            direction: movement::DIR_RIGHT,
+        },
+    )
+    .await?;
+
+    sleep(tutorial::portal_land_pause()).await;
+    send_docs_exclusive(
+        &outbound_tx,
+        vec![
+            protocol::make_map_point(45, 45),
+            protocol::make_movement_packet(14.46, 14.38, 4, movement::DIR_RIGHT, false),
+        ],
+    )
+    .await?;
+    set_local_world_position(&logger, &session_id, &state, 14.46, 14.38).await;
+    send_scheduler_cmd(
+        &outbound_tx,
+        SchedulerCommand::UpdateMovement {
+            world_x: 14.46,
+            world_y: 14.38,
+            is_moving: true,
+            anim: 4,
+            direction: movement::DIR_RIGHT,
+        },
+    )
+    .await?;
+
+    sleep(tutorial::portal_land_pause()).await;
+    send_docs_exclusive(
+        &outbound_tx,
+        vec![
+            protocol::make_map_point(46, 45),
+            protocol::make_movement_packet(14.63, 14.24, movement::ANIM_IDLE, movement::DIR_RIGHT, false),
+        ],
+    )
+    .await?;
+    set_local_world_position(&logger, &session_id, &state, 14.63, 14.24).await;
+    send_scheduler_cmd(
+        &outbound_tx,
+        SchedulerCommand::UpdateMovement {
+            world_x: 14.63,
+            world_y: 14.24,
+            is_moving: false,
+            anim: movement::ANIM_IDLE,
+            direction: movement::DIR_RIGHT,
+        },
+    )
+    .await?;
+
+    sleep(tutorial::portal_land_pause()).await;
+    send_docs_exclusive(
+        &outbound_tx,
+        vec![protocol::make_movement_packet(
+            14.63,
+            14.24,
+            movement::ANIM_IDLE,
+            movement::DIR_RIGHT,
+            false,
+        )],
+    )
+    .await?;
+    set_local_world_position(&logger, &session_id, &state, 14.63, 14.24).await;
+
+    sleep(tutorial::portal_settle_pause()).await;
+    send_docs_exclusive(
+        &outbound_tx,
+        vec![protocol::make_movement_packet(
+            14.71,
+            14.24,
+            movement::ANIM_IDLE,
+            movement::DIR_RIGHT,
+            false,
+        )],
+    )
+    .await?;
+    set_local_world_position(&logger, &session_id, &state, 14.71, 14.24).await;
+    send_scheduler_cmd(
+        &outbound_tx,
+        SchedulerCommand::UpdateMovement {
+            world_x: 14.71,
+            world_y: 14.24,
+            is_moving: false,
+            anim: movement::ANIM_IDLE,
+            direction: movement::DIR_RIGHT,
+        },
+    )
+    .await?;
+
+    sleep(tutorial::portal_walk_step_pause()).await;
+    send_docs_exclusive(
+        &outbound_tx,
+        vec![protocol::make_movement_packet(
+            14.75,
+            14.24,
+            movement::ANIM_IDLE,
+            movement::DIR_RIGHT,
+            false,
+        )],
+    )
+    .await?;
+    set_local_world_position(&logger, &session_id, &state, 14.75, 14.24).await;
+    send_scheduler_cmd(
+        &outbound_tx,
+        SchedulerCommand::UpdateMovement {
+            world_x: 14.75,
+            world_y: 14.24,
+            is_moving: false,
+            anim: movement::ANIM_IDLE,
+            direction: movement::DIR_RIGHT,
+        },
+    )
+    .await?;
+
+    sleep(tutorial::portal_land_pause()).await;
+    send_docs_exclusive(
+        &outbound_tx,
+        vec![protocol::make_movement_packet(
+            14.75,
+            14.24,
+            movement::ANIM_IDLE,
+            movement::DIR_RIGHT,
+            false,
+        )],
+    )
+    .await?;
+    set_local_world_position(&logger, &session_id, &state, 14.75, 14.24).await;
+
+    sleep(tutorial::portal_ready_pause()).await;
+    // send_docs_exclusive(
+    //     &outbound_tx,
+    //     vec![
+    //         protocol::make_empty_movement(),
+    //         protocol::make_tstate(6),
+    //         protocol::make_activate_out_portal(46, 45),
+    //     ],
+    // )
+    // .await?;
+
+    logger.state(
+        Some(&session_id),
+        "tutorial automation: phase 10",
+    );
     Ok(())
+}
+
+async fn wait_for_tutorial_world_ready_to_enter(
+    state: &Arc<RwLock<SessionState>>,
+) -> Result<(), String> {
+    let deadline = Instant::now() + tutorial::world_join_timeout();
+    loop {
+        {
+            let state = state.read().await;
+            if state.current_world.as_deref() == Some(tutorial::TUTORIAL_WORLD)
+                && state.world.is_some()
+                && state.status == SessionStatus::AwaitingReady
+            {
+                return Ok(());
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err("timed out waiting for tutorial GWC phase to finish".to_string());
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn wait_for_tutorial_phase4_ack(
+    state: &Arc<RwLock<SessionState>>,
+) -> Result<(), String> {
+    let deadline = Instant::now() + tutorial::world_join_timeout();
+    loop {
+        {
+            let state = state.read().await;
+            if state.tutorial_phase4_acknowledged {
+                return Ok(());
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err("timed out waiting for tutorial rAI acknowledgement".to_string());
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
 }
 
 async fn ensure_world(
@@ -4160,6 +4632,7 @@ mod tests {
             awaiting_ready: false,
             tutorial_spawn_pod_confirmed: false,
             tutorial_automation_running: false,
+            tutorial_phase4_acknowledged: false,
             fishing: FishingAutomationState::default(),
             ping_ms: None,
         }
@@ -4587,6 +5060,57 @@ async fn set_local_map_position(
         Some(session_id),
         format!(
             "reflected spawn pot choice at map=({map_x}, {map_y}) world=({world_x:.2}, {world_y:.2})"
+        ),
+    );
+    let snapshot = {
+        let state = state.read().await;
+        SessionSnapshot {
+            id: session_id.to_string(),
+            status: state.status.clone(),
+            device_id: state.device_id.clone(),
+            current_host: state.current_host.clone(),
+            current_port: state.current_port,
+            current_world: state.current_world.clone(),
+            pending_world: state.pending_world.clone(),
+            username: state.username.clone(),
+            user_id: state.user_id.clone(),
+            world: state.world.clone(),
+            player_position: state.player_position.clone(),
+            inventory: state
+                .inventory
+                .iter()
+                .map(|e| InventoryItem {
+                    block_id: e.block_id,
+                    inventory_type: e.inventory_type,
+                    amount: e.amount,
+                })
+                .collect(),
+            last_error: state.last_error.clone(),
+            ping_ms: state.ping_ms,
+        }
+    };
+    logger.session_snapshot(snapshot);
+}
+
+async fn set_local_world_position(
+    logger: &Logger,
+    session_id: &str,
+    state: &Arc<RwLock<SessionState>>,
+    world_x: f64,
+    world_y: f64,
+) {
+    let (map_x, map_y) = protocol::world_to_map(world_x, world_y);
+    {
+        let mut state = state.write().await;
+        state.player_position.map_x = Some(map_x);
+        state.player_position.map_y = Some(map_y);
+        state.player_position.world_x = Some(world_x);
+        state.player_position.world_y = Some(world_y);
+    }
+    logger.state(
+        Some(session_id),
+        format!(
+            "reflected scripted world move at map=({map_x:.2}, {map_y:.2}) world=({world_x:.2}, {world_y:.2})"
         ),
     );
     let snapshot = {

@@ -193,6 +193,10 @@ pub fn make_glsi() -> Vec<Document> {
     vec![doc! { "ID": ids::PACKET_ID_GET_LSI }, make_st()]
 }
 
+pub fn make_gfli() -> Document {
+    doc! { "ID": "GFLi" }
+}
+
 pub fn make_join_world(world: &str) -> Document {
     doc! {
         "ID": ids::PACKET_ID_JOIN_WORLD,
@@ -238,6 +242,18 @@ pub fn make_spawn_location_sync(world: &str) -> Vec<Document> {
     vec![make_update_location(world)]
 }
 
+pub fn make_world_enter_ready(world: &str, zoom_amount: f64) -> Vec<Document> {
+    vec![
+        make_update_location(world),
+        doc! { "ID": "cZL", "CZL": 2 },
+        doc! { "ID": "cZva", "Amt": zoom_amount },
+        doc! { "ID": ids::PACKET_ID_R_OP },
+        doc! { "ID": "rAIp" },
+        doc! { "ID": ids::PACKET_ID_R_AI },
+        make_st(),
+    ]
+}
+
 pub fn make_spawn_setup() -> Vec<Document> {
     vec![
         doc! { "ID": "cZL", "CZL": 2 },
@@ -250,6 +266,10 @@ pub fn make_spawn_setup() -> Vec<Document> {
 
 pub fn make_ready_to_play() -> Vec<Document> {
     vec![doc! { "ID": ids::PACKET_ID_READY_TO_PLAY }]
+}
+
+pub fn make_ready_to_play_with_st() -> Vec<Document> {
+    vec![doc! { "ID": ids::PACKET_ID_READY_TO_PLAY }, make_st()]
 }
 
 pub fn make_leave_world() -> Document {
@@ -398,6 +418,14 @@ pub fn make_tstate(value: i32) -> Document {
     doc! {
         "ID": ids::PACKET_ID_TSTATE,
         "Tstate": value,
+    }
+}
+
+pub fn make_audio_player_action(audio_type: i32, audio_block_type: i32) -> Document {
+    doc! {
+        "ID": "PPA",
+        "audioType": audio_type,
+        "audioBlockType": audio_block_type,
     }
 }
 
@@ -613,7 +641,10 @@ pub fn world_to_map(world_x: f64, world_y: f64) -> (f64, f64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{encode_batch, extract_messages, make_vchk, wrap_batch};
+    use super::{
+        encode_batch, extract_messages, make_ready_to_play_with_st, make_vchk,
+        make_world_enter_ready, wrap_batch,
+    };
 
     #[test]
     fn batch_round_trip_preserves_messages() {
@@ -629,5 +660,27 @@ mod tests {
         let bytes = encode_batch(&[make_vchk("abc")]).unwrap();
         let len = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
         assert_eq!(len, bytes.len());
+    }
+
+    #[test]
+    fn world_enter_ready_matches_phase_four_shape() {
+        let batch = make_world_enter_ready("TUTORIAL2", 0.40);
+        let ids = batch
+            .iter()
+            .map(|doc| doc.get_str("ID").unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["ULS", "cZL", "cZva", "rOP", "rAIp", "rAI", "ST"]);
+        assert_eq!(batch[0].get_str("LS").unwrap(), "TUTORIAL2");
+        assert!((batch[2].get_f64("Amt").unwrap() - 0.40).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn ready_to_play_batch_includes_st() {
+        let batch = make_ready_to_play_with_st();
+        let ids = batch
+            .iter()
+            .map(|doc| doc.get_str("ID").unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["RtP", "ST"]);
     }
 }

@@ -23,6 +23,7 @@ pub const TUTORIAL_SPAWN_MAP_Y: i32 = 44;
 // Source: packets.bin rec 230 — mp pM=(42,44).
 pub const SPAWN_POT_MAP_X: i32 = 42;
 pub const SPAWN_POT_MAP_Y: i32 = 44;
+pub const SPAWN_POD_CONFIRM_PATH: &[(i32, i32)] = &[(40, 44), (41, 44), (42, 44)];
 
 pub const CLOTHES_PACK_ID: &str = "BasicClothes";
 pub const CLOTHES_PACK_AE: i32 = 6;
@@ -82,6 +83,70 @@ pub fn long_pause() -> Duration {
 
 pub fn world_join_timeout() -> Duration {
     Duration::from_secs(25)
+}
+
+pub fn initial_spawn_pause() -> Duration {
+    Duration::from_secs(6)
+}
+
+pub fn post_spawn_tstate_pause() -> Duration {
+    Duration::from_secs(5)
+}
+
+pub fn pre_charc_friends_list_pause() -> Duration {
+    Duration::from_secs(8)
+}
+
+pub fn pre_charc_st_pause() -> Duration {
+    Duration::from_millis(800)
+}
+
+pub fn pre_charc_create_pause() -> Duration {
+    Duration::from_millis(267)
+}
+
+pub fn post_apu_first_step_pause() -> Duration {
+    Duration::from_millis(2950)
+}
+
+pub fn post_apu_second_step_pause() -> Duration {
+    Duration::from_millis(534)
+}
+
+pub fn post_apu_third_step_pause() -> Duration {
+    Duration::from_millis(266)
+}
+
+pub fn post_apu_tstate5_pause() -> Duration {
+    Duration::from_millis(1600)
+}
+
+pub fn portal_walk_start_pause() -> Duration {
+    Duration::from_millis(3469)
+}
+
+pub fn portal_walk_step_pause() -> Duration {
+    Duration::from_millis(266)
+}
+
+pub fn portal_walk_idle_pause() -> Duration {
+    Duration::from_millis(1534)
+}
+
+pub fn portal_jump_pause() -> Duration {
+    Duration::from_millis(2935)
+}
+
+pub fn portal_land_pause() -> Duration {
+    Duration::from_millis(267)
+}
+
+pub fn portal_settle_pause() -> Duration {
+    Duration::from_millis(800)
+}
+
+pub fn portal_ready_pause() -> Duration {
+    Duration::from_millis(1868)
 }
 
 pub fn collectable_timeout() -> Duration {
